@@ -1,5 +1,5 @@
 #include "allreduce_ring.h"
-#include "kernels/elementwise_add.h"  // 提供 launch_elementwise_add 声明
+#include "kernels/elementwise_add.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -12,8 +12,6 @@
     }                                                       \
 } while(0)
 
-// 环形 AllReduce（推送模式，向右发送，从左接收）
-// 假设所有 GPU 已启用 P2P 访问，N 可被 num_gpus 整除
 void ring_allreduce(float* data, int N, int rank, int num_gpus, float** all_data) {
     int chunk_size = N / num_gpus;
     float* recv_buf;
@@ -22,38 +20,27 @@ void ring_allreduce(float* data, int N, int rank, int num_gpus, float** all_data
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    int left  = (rank - 1 + num_gpus) % num_gpus;   // 左邻居
-    int right = (rank + 1) % num_gpus;               // 右邻居
+    // 左邻居
+    auto left_peer = [&](int r) { return (r - 1 + num_gpus) % num_gpus; };
+    // 获取指定 GPU 上第 chunk_idx 块的指针
+    auto chunk_ptr = [&](int dev, int chunk_idx) -> float* {
+        return all_data[dev] + chunk_idx * chunk_size;
+    };
 
-    // ==================== Reduce-Scatter 阶段 ====================
+    // ==================== Reduce-Scatter ====================
     for (int step = 0; step < num_gpus - 1; ++step) {
-        // 本步要发送给右邻居的 chunk 编号
-        int send_chunk = (rank - step + num_gpus) % num_gpus;
-        // 本步要从左邻居接收并归约的 chunk 编号
-        int recv_chunk = (rank - step - 1 + num_gpus) % num_gpus;
+        int recv_chunk = (rank - step - 1 + num_gpus) % num_gpus; // 本 rank 要接收并归约的块
+        int peer = left_peer(rank);
 
-        // 1. 将本地 send_chunk 推送到右邻居的对应位置
+        // 从左邻居拉取它的 recv_chunk（即邻居本次要发送的块）
         CUDA_CHECK(cudaMemcpyPeerAsync(
-            all_data[right] + send_chunk * chunk_size,  // 右邻居的 send_chunk 地址
-            right,                                      // 右邻居设备号
-            data + send_chunk * chunk_size,             // 本地 send_chunk 数据
-            rank,                                       // 本设备号
-            chunk_size * sizeof(float),
-            stream
-        ));
-
-        // 2. 从左邻居接收它的 send_chunk (即本地的 recv_chunk) 到 recv_buf
-        CUDA_CHECK(cudaMemcpyPeerAsync(
-            recv_buf,                                   // 本地接收缓冲区
-            rank,
-            all_data[left] + recv_chunk * chunk_size,   // 左邻居的 recv_chunk 数据
-            left,                                       // 左邻居设备号
+            recv_buf, rank,
+            chunk_ptr(peer, recv_chunk), peer,
             chunk_size * sizeof(float),
             stream
         ));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // 3. 将收到的数据累加到本地 recv_chunk
         launch_elementwise_add(
             data + recv_chunk * chunk_size,
             recv_buf,
@@ -64,38 +51,25 @@ void ring_allreduce(float* data, int N, int rank, int num_gpus, float** all_data
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
-    // ==================== All-Gather 阶段 ====================
+    // ==================== All-Gather ====================
     for (int step = 0; step < num_gpus - 1; ++step) {
-        int send_chunk = (rank - step + 1 + num_gpus) % num_gpus;
-        int recv_chunk = (rank - step + num_gpus) % num_gpus;
+        int recv_chunk = (rank - step + num_gpus) % num_gpus; // 本 rank 要接收并覆盖的块
+        int peer = left_peer(rank);
 
-        // 1. 推送本地已归约的 send_chunk 到右邻居
+        // 从左邻居拉取它的 recv_chunk（邻居要发送的块，恰好等于本地的 recv_chunk）
         CUDA_CHECK(cudaMemcpyPeerAsync(
-            all_data[right] + send_chunk * chunk_size,
-            right,
-            data + send_chunk * chunk_size,
-            rank,
-            chunk_size * sizeof(float),
-            stream
-        ));
-
-        // 2. 从左邻居接收其 send_chunk (即本地的 recv_chunk)
-        CUDA_CHECK(cudaMemcpyPeerAsync(
-            recv_buf,
-            rank,
-            all_data[left] + recv_chunk * chunk_size,
-            left,
+            recv_buf, rank,
+            chunk_ptr(peer, recv_chunk), peer,
             chunk_size * sizeof(float),
             stream
         ));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // 3. 用接收到的数据覆盖本地 recv_chunk（无需累加）
-        CUDA_CHECK(cudaMemcpyAsync(
-            data + recv_chunk * chunk_size,
-            recv_buf,
+        // 覆盖本地 recv_chunk
+        CUDA_CHECK(cudaMemcpyPeerAsync(
+            data + recv_chunk * chunk_size, rank,
+            recv_buf, rank,
             chunk_size * sizeof(float),
-            cudaMemcpyDeviceToDevice,
             stream
         ));
         CUDA_CHECK(cudaStreamSynchronize(stream));
