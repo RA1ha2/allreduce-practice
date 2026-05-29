@@ -13,14 +13,12 @@
     }                                                       \
 } while(0)
 
-// 用随机数填充数组
 void fill_random(float* data, int N) {
     for (int i = 0; i < N; ++i)
         data[i] = static_cast<float>(rand()) / RAND_MAX;
 }
 
 int main(int argc, char** argv) {
-    // 默认测试 4 张 GPU，可通过命令行参数指定
     int num_gpus = 4;
     if (argc > 1) num_gpus = atoi(argv[1]);
     if (num_gpus < 2) {
@@ -28,7 +26,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 检查实际可用 GPU 数量
     int dev_count;
     CUDA_CHECK(cudaGetDeviceCount(&dev_count));
     if (num_gpus > dev_count) {
@@ -38,18 +35,17 @@ int main(int argc, char** argv) {
     }
     printf("Running on %d GPUs...\n", num_gpus);
 
-    // 1. 启用所有 GPU 间的 P2P 访问
- 
-    // 2. 数据大小：1M floats，保证能被 num_gpus 整除
+    // 不再强制检查 P2P，cudaMemcpyPeerAsync 会在不支持时自动失败
+
+    // 数据大小（1M floats，对齐到 num_gpus）
     int base_N = 1024 * 1024;
-    int N = (base_N / num_gpus) * num_gpus;  // 向下对齐
+    int N = (base_N / num_gpus) * num_gpus;
     const int bytes = N * sizeof(float);
     printf("Data size per GPU: %d floats (%.2f MB)\n", N, bytes / (1024.0 * 1024.0));
 
-    // 3. 为每张 GPU 分配显存并初始化主机数据
-    float** h_data = (float**)malloc(num_gpus * sizeof(float*));     // 主机端各 GPU 的原始数据
-    float** d_data = (float**)malloc(num_gpus * sizeof(float*));     // 设备指针数组（主机侧保存）
-
+    // 分配内存
+    float** h_data = (float**)malloc(num_gpus * sizeof(float*));
+    float** d_data = (float**)malloc(num_gpus * sizeof(float*));
     for (int i = 0; i < num_gpus; ++i) {
         CUDA_CHECK(cudaSetDevice(i));
         CUDA_CHECK(cudaMalloc(&d_data[i], bytes));
@@ -58,20 +54,19 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(d_data[i], h_data[i], bytes, cudaMemcpyHostToDevice));
     }
 
-    // 4. 执行 Ring AllReduce（每张卡调用一次，主机端串行设置）
+    // 执行 Ring AllReduce
     for (int i = 0; i < num_gpus; ++i) {
         CUDA_CHECK(cudaSetDevice(i));
         ring_allreduce(d_data[i], N, i, num_gpus, d_data);
     }
 
-    // 等待所有 GPU 操作完成
+    // 同步所有设备
     for (int i = 0; i < num_gpus; ++i) {
         CUDA_CHECK(cudaSetDevice(i));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
-    // 5. 验证：所有 GPU 结果应相同，且等于所有原始数据之和
-    // 计算 CPU 预期值
+    // 验证
     float* expected = (float*)malloc(bytes);
     for (int j = 0; j < N; ++j) {
         float sum = 0.0f;
@@ -97,7 +92,7 @@ int main(int argc, char** argv) {
     else
         printf("❌ FAILED!\n");
 
-    // 6. 清理资源
+    // 清理
     for (int i = 0; i < num_gpus; ++i) {
         CUDA_CHECK(cudaSetDevice(i));
         CUDA_CHECK(cudaFree(d_data[i]));
