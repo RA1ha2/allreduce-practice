@@ -39,20 +39,7 @@ int main(int argc, char** argv) {
     printf("Running on %d GPUs...\n", num_gpus);
 
     // 1. 启用所有 GPU 间的 P2P 访问
-    for (int i = 0; i < num_gpus; ++i) {
-        CUDA_CHECK(cudaSetDevice(i));
-        for (int j = 0; j < num_gpus; ++j) {
-            if (i == j) continue;
-            int canPeer = 0;
-            CUDA_CHECK(cudaDeviceCanAccessPeer(&canPeer, i, j));
-            if (!canPeer) {
-                printf("P2P from GPU %d to %d not supported.\n", i, j);
-                return 1;
-            }
-            CUDA_CHECK(cudaDeviceEnablePeerAccess(j, 0));
-        }
-    }
-
+ 
     // 2. 数据大小：1M floats，保证能被 num_gpus 整除
     int base_N = 1024 * 1024;
     int N = (base_N / num_gpus) * num_gpus;  // 向下对齐
